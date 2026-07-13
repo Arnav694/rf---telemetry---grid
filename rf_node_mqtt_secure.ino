@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <RF24.h>
+#include <DHT.h>
 
 const char* ssid = "Airtel_ravi_5130_EXT";
 const char* password = "air58823";
@@ -22,6 +23,35 @@ PubSubClient client(espClient);
 // ---- NRF24L01 passive spectrum scan ----
 // Wiring: CE=GPIO4 CSN=GPIO5 SCK=GPIO18 MOSI=GPIO23 MISO=GPIO19, VCC->3.3V ONLY
 RF24 radio(4, 5); // CE, CSN
+
+#define DHTPIN 15
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// DHT11 occasionally returns a bad read (NaN) -- fall back to the last
+// known-good value instead of publishing garbage when that happens.
+float lastGoodTemp     = 25.0;
+float lastGoodHumidity = 50.0;
+
+float readTemperature() {
+  float t = dht.readTemperature();
+  if (isnan(t)) {
+    Serial.println("DHT11 temperature read failed -- using last good value");
+    return lastGoodTemp;
+  }
+  lastGoodTemp = t;
+  return t;
+}
+
+float readHumidity() {
+  float h = dht.readHumidity();
+  if (isnan(h)) {
+    Serial.println("DHT11 humidity read failed -- using last good value");
+    return lastGoodHumidity;
+  }
+  lastGoodHumidity = h;
+  return h;
+}
 
 const int NUM_CHANNELS = 126;       // channels 0-125 => 2400-2525 MHz
 const int SAMPLES_PER_CHANNEL = 20; // reps per channel per sweep
@@ -121,8 +151,8 @@ void loop() {
 
   StaticJsonDocument<128> doc;
   doc["node_id"] = node_id;
-  doc["temp"] = 5000;
-  doc["humidity"] = 0.0004;
+  doc["temp"] = readTemperature();
+  doc["humidity"] = readHumidity();
   doc["score"] = score;
   doc["loudest_ch"] = latestLoudestCh;
   doc["loudest_hits"] = latestLoudestHits;
