@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>India RF Telemetry Grid</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    body {
+      font-family: monospace;
+      background: #0d1117;
+      color: #c9d1d9;
+      text-align: center;
+      padding: 30px 10px;
+      margin: 0;
+    }
+    h1 { color: #58a6ff; margin-bottom: 5px; }
+    #status {
+      font-size: 0.9em;
+      margin-bottom: 25px;
+      color: #8b949e;
+    }
+    #status.connected { color: #3fb950; }
+    #status.error { color: #f85149; }
+    #nodes {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      max-width: 1000px;
+      margin: 0 auto;
+    }
+    .node-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 10px;
+      padding: 16px;
+      transition: opacity 0.3s;
+    }
+    .node-card.stale { opacity: 0.4; }
+    .node-card h3 {
+      margin: 0 0 10px 0;
+      color: #d29922;
+      font-size: 1.1em;
+      word-break: break-word;
+    }
+    .metric { margin: 8px 0; }
+    .metric .val { font-size: 1.6em; color: #58a6ff; display: block; }
+    .metric .label { font-size: 0.75em; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+    .lastseen { font-size: 0.7em; color: #8b949e; margin-top: 10px; }
+    #empty { color: #8b949e; margin-top: 40px; }
+  </style>
+</head>
+<body>
+  <h1>India RF Telemetry Grid</h1>
+  <div id="status">Connecting to broker...</div>
+  <div id="nodes"></div>
+  <div id="empty">No nodes have reported in yet.</div>
+
+  <script>
+    // Must match every node's aesKey[] EXACTLY.
+    const AES_KEY_BYTES = new Uint8Array([0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]);
+
+    // Your private HiveMQ Cloud cluster, over secure WebSocket (TLS).
+    const MQTT_WS_URL = 'wss://9fa5d7e2411f4135a2b5e478fe4d2850.s1.eu.hivemq.cloud:8884/mqtt';
+
+    // Private HiveMQ Cloud clusters require auth even for a page that's
+    // just listening -- unlike the old public test broker. Anyone who
+    // views this page's source can see these values, since there's no
+    // way to hide secrets in client-side JS. Acceptable for a class
+    // project talking to your own broker; not something you'd do for a
+    // broker holding anything sensitive.
+    const MQTT_USERNAME = 'YOUR_HIVEMQ_USERNAME';
+    const MQTT_PASSWORD = 'YOUR_HIVEMQ_PASSWORD';
+
+    // '+' is an MQTT single-level wildcard -- matches ANY node name in
+    // that position, so this one subscription catches every teammate's
+    // node at once. Everyone's ESP32 topic must be "rf-telemetry/<name>"
+    // for their card to show up here.
+    const TOPIC_FILTER = 'rf-telemetry/+';
+
+    const STALE_AFTER_MS = 30000; // grey out a card if it hasn't reported in 30s
+
+    function hexToBytes(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+      }
+      return bytes;
+    }
+
+    async function decryptPayload(hexPayload) {
+      const raw = hexToBytes(hexPayload);
+      const iv = raw.slice(0, 16);
+      const ciphertext = raw.slice(16);
+      const cryptoKey = await crypto.subtle.importKey(
+        'raw', AES_KEY_BYTES, { name: 'AES-CBC' }, false, ['decrypt']
+      );
+      const decryptedBuffer = await crypto.subtle.decrypt(
+        { name: 'AES-CBC', iv: iv }, cryptoKey, ciphertext
+      );
+      return new TextDecoder().decode(decryptedBuffer);
+    }
+
+    function extractNodeName(topic) {
+      const parts = topic.split('/');
+      return parts.length >= 2 ? parts[1] : topic;
+    }
+
+    const nodeCards = {}; // nodeName -> {el, score, loudest, lastseen, lastUpdate}
+
+    function upsertCard(nodeName, data) {
+      document.getElementById('empty').style.display = 'none';
+      let card = nodeCards[nodeName];
+
+      if (!card) {
+        const el = document.createElement('div');
+        el.className = 'node-card';
+        el.innerHTML = `
+          <h3>${nodeName}</h3>
+          <div class="metric"><span class="val score">--</span><span class="label">Congestion</span></div>
+          <div class="metric"><span class="val loudest">--</span><span class="label">Loudest channel</span></div>
+          <div class="lastseen">--</div>
+        `;
+        document.getElementById('nodes').appendChild(el);
+        card = {
+          el,
+          score: el.querySelector('.score'),
+          loudest: el.querySelector('.loudest'),
+          lastseen: el.querySelector('.lastseen'),
+          lastUpdate: 0
+        };
+        nodeCards[nodeName] = card;
+      }
+
+      card.score.innerText = data.score;
+      card.loudest.innerText = data.loudestHits > 0
+        ? `ch ${data.loudestCh} (~${data.loudestFreq}MHz)`
+        : 'quiet';
+      card.lastUpdate = Date.now();
+      card.lastseen.innerText = 'Last seen: ' + new Date().toLocaleTimeString();
+      card.el.classList.remove('stale');
+    }
+
+    // Periodically grey out any card that's gone quiet -- catches a
+    // node that crashed, lost WiFi, or was switched off.
+    setInterval(() => {
+      const now = Date.now();
+      for (const nodeName in nodeCards) {
+        const card = nodeCards[nodeName];
+        if (now - card.lastUpdate > STALE_AFTER_MS) {
+          card.el.classList.add('stale');
+        }
+      }
+    }, 5000);
+
+    const statusEl = document.getElementById('status');
+    const client = mqtt.connect(MQTT_WS_URL, {
+      username: MQTT_USERNAME,
+      password: MQTT_PASSWORD
+    });
+
+    client.on('connect', () => {
+      statusEl.innerText = 'Connected -- listening for nodes';
+      statusEl.className = 'connected';
+      client.subscribe(TOPIC_FILTER);
+    });
+
+    client.on('reconnect', () => {
+      statusEl.innerText = 'Reconnecting...';
+      statusEl.className = '';
+    });
+
+    client.on('error', (err) => {
+      statusEl.innerText = 'Connection error: ' + err.message;
+      statusEl.className = 'error';
+    });
+
+    client.on('message', async (topic, payload) => {
+      const hexPayload = payload.toString();
+      try {
+        const decrypted = await decryptPayload(hexPayload);
+        const data = JSON.parse(decrypted);
+        upsertCard(extractNodeName(topic), data);
+      } catch (e) {
+        console.error('Failed to decrypt/parse message on topic', topic, e);
+      }
+    });
+  </script>
+</body>
+</html>
