@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>RF Telemetry Dashboard</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #111;
+            color: #eee;
+            padding: 20px;
+        }
+
+        .card {
+            background: #222;
+            border-radius: 8px;
+            padding: 16px;
+            margin: 10px 0;
+            width: 260px;
+        }
+
+        .stale {
+            opacity: 0.4;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Live Nodes</h2>
+    <div id="cards"></div>
+
+    <script>
+        const nodes = {};
+
+        const client = mqtt.connect('wss://955582be306a4529b8874ee52640cc86.s1.eu.hivemq.cloud:8884/mqtt', {
+            username: 'STP THING',
+            password: 'GROUP3STPTHING'
+        });
+
+        client.on('connect', () => {
+            console.log('connected to broker');
+            client.subscribe('rf-telemetry/+');
+        });
+
+        client.on('message', (topic, message) => {
+            const data = JSON.parse(message.toString());
+            nodes[data.node_id] = { ...data, lastSeen: Date.now() };
+            render();
+        });
+
+        function render() {
+            const container = document.getElementById('cards');
+            container.innerHTML = '';
+            for (const id in nodes) {
+                const n = nodes[id];
+                const isStale = Date.now() - n.lastSeen > 30000;
+                const div = document.createElement('div');
+                div.className = 'card' + (isStale ? ' stale' : '');
+                div.innerHTML = `<b>${id}</b><br>
+                    Temp: ${n.temp}°C<br>
+                    Humidity: ${n.humidity}%<br>
+                    Congestion score: ${n.score}/100<br>
+                    Loudest channel: ch ${n.loudest_ch} (${n.loudest_hits} hits)`;
+                container.appendChild(div);
+            }
+        }
+
+        setInterval(render, 5000);
+    </script>
+</body>
+
+</html>
