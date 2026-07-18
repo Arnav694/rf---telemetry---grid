@@ -23,7 +23,7 @@ function HealthIndicator({ label, ok }: { label: string; ok: boolean | null }) {
     return (
       <div className="health-item health-item--unknown">
         <span className="health-dot" />
-        {label}: <span>Unknown</span>
+        {label}: <span>Unavailable</span>
       </div>
     );
   }

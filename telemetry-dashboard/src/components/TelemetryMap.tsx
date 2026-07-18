@@ -108,6 +108,7 @@ export function TelemetryMap({ nodes, onSelectNode, compact = false }: Telemetry
           {mappable.map((node) => {
             const status = getNodeStatus(node);
             const color  = STATUS_COLOR[status];
+            const muted  = status === 'offline';
             return (
               <CircleMarker
                 key={node.node_id}
@@ -115,10 +116,10 @@ export function TelemetryMap({ nodes, onSelectNode, compact = false }: Telemetry
                 radius={compact ? 7 : 11}
                 pathOptions={{
                   fillColor:   color,
-                  fillOpacity: 0.85,
-                  color:       '#fff',
-                  weight:      2,
-                  opacity:     0.7,
+                  fillOpacity: muted ? 0.45 : 0.85,
+                  color:       muted ? color : '#fff',
+                  weight:      muted ? 1 : 2,
+                  opacity:     muted ? 0.4 : 0.7,
                 }}
               >
                 <Popup>

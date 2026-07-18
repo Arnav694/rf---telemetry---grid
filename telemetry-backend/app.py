@@ -8,6 +8,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -32,7 +33,58 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "rf-telemetry/+")
 CA_CERT_PATH = os.getenv("CA_CERT_PATH")
 
 AES_KEY_HEX = os.getenv("AES_KEY_HEX", "")
-AES_KEY = bytes.fromhex(AES_KEY_HEX)
+
+try:
+    AES_KEY = bytes.fromhex(AES_KEY_HEX)
+except ValueError:
+    AES_KEY = b""
+
+
+# =========================================================
+# Node registry
+# =========================================================
+
+NODE_REGISTRY_PATH = Path(__file__).with_name("node_registry.json")
+
+
+def load_node_registry() -> dict[str, dict[str, Any]]:
+    if not NODE_REGISTRY_PATH.exists():
+        print(
+            "Warning: node_registry.json was not found at "
+            f"{NODE_REGISTRY_PATH}"
+        )
+        return {}
+
+    try:
+        with NODE_REGISTRY_PATH.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                "node_registry.json must contain a JSON object."
+            )
+
+        valid_registry: dict[str, dict[str, Any]] = {}
+
+        for node_id, entry in data.items():
+            if isinstance(node_id, str) and isinstance(entry, dict):
+                valid_registry[node_id] = entry
+
+        print(
+            f"Loaded {len(valid_registry)} node registry entries."
+        )
+
+        return valid_registry
+
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(f"Failed to load node registry: {error}")
+        return {}
+
+
+NODE_REGISTRY = load_node_registry()
 
 
 # =========================================================
@@ -43,7 +95,7 @@ state_lock = threading.Lock()
 
 latest_nodes: dict[str, dict[str, Any]] = {}
 
-# Keeps the latest 300 readings for each node in memory.
+# Stores the latest 300 readings for every node.
 node_history: dict[str, deque[dict[str, Any]]] = defaultdict(
     lambda: deque(maxlen=300)
 )
@@ -55,7 +107,7 @@ mqtt_client: mqtt.Client | None = None
 
 
 # =========================================================
-# Utility functions
+# General utilities
 # =========================================================
 
 def get_first(
@@ -113,7 +165,7 @@ def validate_configuration() -> None:
             "AES_KEY_HEX must represent a 16, 24, or 32-byte AES key."
         )
 
-    if not os.path.isfile(CA_CERT_PATH):
+    if CA_CERT_PATH is None or not os.path.isfile(CA_CERT_PATH):
         raise FileNotFoundError(
             f"CA certificate not found: {CA_CERT_PATH}"
         )
@@ -126,9 +178,37 @@ def validate_configuration() -> None:
 def decrypt_payload(
     envelope: dict[str, Any],
 ) -> dict[str, Any]:
-    nonce = base64.b64decode(envelope["nonce"])
-    ciphertext = base64.b64decode(envelope["ciphertext"])
-    tag = base64.b64decode(envelope["tag"])
+    required_fields = (
+        "nonce",
+        "ciphertext",
+        "tag",
+    )
+
+    missing = [
+        field
+        for field in required_fields
+        if not envelope.get(field)
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Encrypted payload is missing: {', '.join(missing)}"
+        )
+
+    nonce = base64.b64decode(
+        envelope["nonce"],
+        validate=True,
+    )
+
+    ciphertext = base64.b64decode(
+        envelope["ciphertext"],
+        validate=True,
+    )
+
+    tag = base64.b64decode(
+        envelope["tag"],
+        validate=True,
+    )
 
     aesgcm = AESGCM(AES_KEY)
 
@@ -138,7 +218,16 @@ def decrypt_payload(
         None,
     )
 
-    return json.loads(plaintext.decode("utf-8"))
+    decoded = json.loads(
+        plaintext.decode("utf-8")
+    )
+
+    if not isinstance(decoded, dict):
+        raise ValueError(
+            "Decrypted telemetry must be a JSON object."
+        )
+
+    return decoded
 
 
 # =========================================================
@@ -161,6 +250,11 @@ def normalize_telemetry(
             "id",
             default=topic_node_id,
         )
+    )
+
+    registry_entry = NODE_REGISTRY.get(
+        node_id,
+        {},
     )
 
     temperature = to_float(
@@ -189,24 +283,29 @@ def normalize_telemetry(
     )
 
     if isinstance(rf_noise_value, list):
-        rf_noise = [
-            to_int(value) or 0
-            for value in rf_noise_value
-        ]
+        rf_noise = []
+
+        for value in rf_noise_value:
+            parsed_value = to_int(value)
+            rf_noise.append(
+                parsed_value if parsed_value is not None else 0
+            )
     else:
         rf_noise = []
 
-    score_value = get_first(
-        data,
-        "score",
-        "congestion_score",
-        "rf_score",
+    congestion_score = to_float(
+        get_first(
+            data,
+            "score",
+            "congestion_score",
+            "rf_score",
+        )
     )
 
-    score = to_float(score_value)
-
-    if score is None and rf_noise:
-        score = sum(rf_noise) / len(rf_noise)
+    if congestion_score is None and rf_noise:
+        congestion_score = (
+            sum(rf_noise) / len(rf_noise)
+        )
 
     loudest_channel = to_int(
         get_first(
@@ -236,14 +335,50 @@ def normalize_telemetry(
         if loudest_hits is None:
             loudest_hits = rf_noise[derived_channel]
 
+    latitude = to_float(
+        get_first(
+            data,
+            "lat",
+            "latitude",
+            default=registry_entry.get("latitude"),
+        )
+    )
+
+    longitude = to_float(
+        get_first(
+            data,
+            "lon",
+            "longitude",
+            default=registry_entry.get("longitude"),
+        )
+    )
+
     received_at = utc_now_iso()
+
+    algorithm: str | None = None
+
+    if encrypted:
+        if outer_envelope:
+            algorithm_value = outer_envelope.get(
+                "algorithm"
+            )
+
+            if algorithm_value:
+                algorithm = str(algorithm_value)
+
+        if algorithm is None:
+            algorithm = "unknown"
 
     normalized = {
         "node_id": node_id,
+        "display_name": (
+            registry_entry.get("display_name")
+            or node_id
+        ),
         "topic": topic,
         "temperature": temperature,
         "humidity": humidity,
-        "congestion_score": score,
+        "congestion_score": congestion_score,
         "loudest_channel": loudest_channel,
         "loudest_hits": loudest_hits,
         "rf_noise": rf_noise,
@@ -261,11 +396,7 @@ def normalize_telemetry(
         "last_seen_epoch": time.time(),
         "online": True,
         "encrypted": encrypted,
-        "algorithm": (
-            outer_envelope.get("algorithm")
-            if outer_envelope
-            else None
-        ),
+        "algorithm": algorithm,
         "sensor_ok": get_first(
             data,
             "sensor_ok",
@@ -276,38 +407,148 @@ def normalize_telemetry(
             "radio_ok",
             "Rstatus",
         ),
+        "payload_status": get_first(
+            data,
+            "payload_status",
+            default="ok",
+        ),
+        "encrypted_blob_length": to_int(
+            get_first(
+                data,
+                "encrypted_blob_length",
+            )
+        ),
         "city": get_first(
             data,
             "city",
             "location",
+            default=registry_entry.get("city"),
         ),
-        "latitude": to_float(
-            get_first(data, "lat", "latitude")
+        "state": get_first(
+            data,
+            "state",
+            default=registry_entry.get("state"),
         ),
-        "longitude": to_float(
-            get_first(data, "lon", "longitude")
-        ),
+        "latitude": latitude,
+        "longitude": longitude,
     }
 
     return normalized
 
 
 # =========================================================
-# WebSocket broadcasting
+# Snapshot and registered-node handling
 # =========================================================
+
+def build_registered_offline_node(
+    node_id: str,
+    registry_entry: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "node_id": node_id,
+        "display_name": (
+            registry_entry.get("display_name")
+            or node_id
+        ),
+        "topic": f"rf-telemetry/{node_id}",
+        "temperature": None,
+        "humidity": None,
+        "congestion_score": None,
+        "loudest_channel": None,
+        "loudest_hits": None,
+        "rf_noise": [],
+        "schema_version": 1,
+        "source_timestamp": None,
+        "received_at": None,
+        "last_seen_epoch": None,
+        "online": False,
+        "encrypted": False,
+        "algorithm": None,
+        "sensor_ok": None,
+        "radio_ok": None,
+        "payload_status": "awaiting_telemetry",
+        "encrypted_blob_length": None,
+        "city": registry_entry.get("city"),
+        "state": registry_entry.get("state"),
+        "latitude": to_float(
+            registry_entry.get("latitude")
+        ),
+        "longitude": to_float(
+            registry_entry.get("longitude")
+        ),
+    }
+
+
+def merge_registry_into_node(
+    node: dict[str, Any],
+) -> dict[str, Any]:
+    merged = node.copy()
+
+    registry_entry = NODE_REGISTRY.get(
+        str(merged.get("node_id", "")),
+        {},
+    )
+
+    if not registry_entry:
+        return merged
+
+    if not merged.get("display_name"):
+        merged["display_name"] = (
+            registry_entry.get("display_name")
+            or merged["node_id"]
+        )
+
+    if not merged.get("city"):
+        merged["city"] = registry_entry.get("city")
+
+    if not merged.get("state"):
+        merged["state"] = registry_entry.get("state")
+
+    if merged.get("latitude") is None:
+        merged["latitude"] = to_float(
+            registry_entry.get("latitude")
+        )
+
+    if merged.get("longitude") is None:
+        merged["longitude"] = to_float(
+            registry_entry.get("longitude")
+        )
+
+    return merged
+
 
 def get_nodes_snapshot() -> list[dict[str, Any]]:
     with state_lock:
-        snapshot = [
-            node.copy()
-            for node in latest_nodes.values()
-        ]
+        snapshot_by_id = {
+            node_id: merge_registry_into_node(
+                node.copy()
+            )
+            for node_id, node in latest_nodes.items()
+        }
+
+    # Include registered nodes that have not published yet.
+    for node_id, registry_entry in NODE_REGISTRY.items():
+        if node_id not in snapshot_by_id:
+            snapshot_by_id[node_id] = (
+                build_registered_offline_node(
+                    node_id,
+                    registry_entry,
+                )
+            )
 
     return sorted(
-        snapshot,
-        key=lambda node: node["node_id"],
+        snapshot_by_id.values(),
+        key=lambda node: str(
+            node.get("display_name")
+            or node.get("node_id")
+            or ""
+        ).lower(),
     )
 
+
+# =========================================================
+# WebSocket broadcasting
+# =========================================================
 
 async def broadcast_nodes() -> None:
     if not websocket_clients:
@@ -375,22 +616,68 @@ def on_mqtt_message(
         outer_message = json.loads(
             message.payload.decode("utf-8")
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        print(f"[INVALID JSON] {topic}: {error}")
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
+        print(
+            f"[INVALID JSON] {topic}: {error}"
+        )
         return
 
-    encrypted = (
+    if not isinstance(outer_message, dict):
+        print(
+            f"[INVALID PAYLOAD] {topic}: "
+            "expected a JSON object"
+        )
+        return
+
+    aes_gcm_encrypted = (
         outer_message.get("payload_type")
         == "encrypted_telemetry"
     )
 
+    legacy_encrypted = isinstance(
+        outer_message.get("encrypted"),
+        str,
+    )
+
     try:
-        if encrypted:
+        if aes_gcm_encrypted:
             telemetry = decrypt_payload(
                 outer_message
             )
+            encrypted = True
+            message_type = "DECRYPTED"
+
+        elif legacy_encrypted:
+            encrypted_blob = outer_message[
+                "encrypted"
+            ]
+
+            telemetry = {
+                "node_id": outer_message.get(
+                    "node_id",
+                    topic.split("/")[-1],
+                ),
+                "timestamp": outer_message.get(
+                    "timestamp"
+                ),
+                "payload_status": (
+                    "unsupported_encryption_format"
+                ),
+                "encrypted_blob_length": len(
+                    encrypted_blob
+                ),
+            }
+
+            encrypted = True
+            message_type = "UNSUPPORTED ENCRYPTED"
+
         else:
             telemetry = outer_message
+            encrypted = False
+            message_type = "PLAINTEXT"
 
         normalized = normalize_telemetry(
             telemetry,
@@ -407,18 +694,15 @@ def on_mqtt_message(
                 normalized.copy()
             )
 
-        message_type = (
-            "DECRYPTED"
-            if encrypted
-            else "PLAINTEXT"
-        )
-
         print(
             f"[{message_type}] "
             f"{node_id}: "
-            f"{normalized['temperature']}°C, "
-            f"{normalized['humidity']}%, "
-            f"score={normalized['congestion_score']}"
+            f"temperature={normalized['temperature']}, "
+            f"humidity={normalized['humidity']}, "
+            f"score={normalized['congestion_score']}, "
+            f"location="
+            f"{normalized['latitude']},"
+            f"{normalized['longitude']}"
         )
 
         if (
@@ -508,12 +792,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="RF Telemetry Grid API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
-# Development configuration.
-# We will restrict this before public deployment.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -546,7 +828,12 @@ def health() -> dict[str, Any]:
         "api": "online",
         "mqtt_connected": mqtt_connected,
         "subscribed_topic": MQTT_TOPIC,
-        "node_count": len(get_nodes_snapshot()),
+        "node_count": len(
+            get_nodes_snapshot()
+        ),
+        "registered_node_count": len(
+            NODE_REGISTRY
+        ),
     }
 
 
@@ -562,16 +849,16 @@ def get_nodes() -> dict[str, Any]:
 
 @app.get("/api/nodes/{node_id}")
 def get_node(node_id: str) -> dict[str, Any]:
-    with state_lock:
-        node = latest_nodes.get(node_id)
+    nodes = get_nodes_snapshot()
 
-    if node is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Node not found",
-        )
+    for node in nodes:
+        if node.get("node_id") == node_id:
+            return node
 
-    return node
+    raise HTTPException(
+        status_code=404,
+        detail="Node not found",
+    )
 
 
 @app.get("/api/nodes/{node_id}/history")
@@ -579,25 +866,45 @@ def get_node_history(
     node_id: str,
     limit: int = 100,
 ) -> dict[str, Any]:
-    safe_limit = max(1, min(limit, 300))
+    safe_limit = max(
+        1,
+        min(limit, 300),
+    )
 
     with state_lock:
         readings = list(
-            node_history.get(node_id, [])
+            node_history.get(
+                node_id,
+                [],
+            )
         )
 
     if not readings:
         raise HTTPException(
             status_code=404,
-            detail="No history found for this node",
+            detail=(
+                "No telemetry history found "
+                "for this node"
+            ),
         )
 
-    readings = readings[-safe_limit:]
+    readings = [
+        merge_registry_into_node(reading)
+        for reading in readings[-safe_limit:]
+    ]
 
     return {
         "node_id": node_id,
         "count": len(readings),
         "readings": readings,
+    }
+
+
+@app.get("/api/registry")
+def get_registry() -> dict[str, Any]:
+    return {
+        "count": len(NODE_REGISTRY),
+        "nodes": NODE_REGISTRY,
     }
 
 
@@ -622,11 +929,14 @@ async def websocket_endpoint(
 
     try:
         while True:
-            # Keeps the socket open and detects disconnects.
             await websocket.receive_text()
 
     except WebSocketDisconnect:
-        websocket_clients.discard(websocket)
+        websocket_clients.discard(
+            websocket
+        )
 
     except Exception:
-        websocket_clients.discard(websocket)
+        websocket_clients.discard(
+            websocket
+        )

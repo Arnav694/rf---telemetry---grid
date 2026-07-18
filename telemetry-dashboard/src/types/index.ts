@@ -19,6 +19,8 @@ export interface NodeData {
   city: string | null;
   latitude: number | null;
   longitude: number | null;
+  /** Backend sets this to "awaiting_telemetry" for nodes that have never published */
+  payload_status?: string | null;
 }
 
 export interface HealthResponse {
@@ -33,6 +35,6 @@ export interface NodesResponse {
   nodes: NodeData[];
 }
 
-export type NodeStatus = 'live' | 'stale' | 'offline' | 'unknown';
+export type NodeStatus = 'live' | 'stale' | 'offline';
 export type WsStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 export type AppView = 'dashboard' | 'map';

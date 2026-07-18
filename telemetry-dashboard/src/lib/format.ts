@@ -25,7 +25,7 @@ export function fmtChannel(channel: number | null | undefined): string {
 }
 
 export function fmtRelative(epochSeconds: number | null | undefined): string {
-  if (epochSeconds == null) return 'Unknown';
+  if (epochSeconds == null || epochSeconds === 0) return 'Never';
   const diffMs = Date.now() - epochSeconds * 1000;
   const diffS = Math.floor(diffMs / 1000);
   if (diffS < 0) return 'just now';

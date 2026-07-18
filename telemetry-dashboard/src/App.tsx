@@ -3,6 +3,7 @@ import { Menu, Map, LayoutDashboard } from 'lucide-react';
 import type { AppView, NodeData } from './types';
 import { useTelemetry } from './hooks/useTelemetry';
 import { useHealth } from './hooks/useHealth';
+import { useTick } from './hooks/useTick';
 import { sortByStatus } from './lib/status';
 import { Sidebar } from './components/Sidebar';
 import { OverviewStats } from './components/OverviewStats';
@@ -16,6 +17,9 @@ import './index.css';
 export default function App() {
   const { nodes, wsStatus, loading, backendError, lastUpdate } = useTelemetry();
   const health = useHealth();
+  // Shared 10-second tick so node status (live→stale→offline) transitions
+  // even when no new WebSocket message arrives.
+  useTick(10_000);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [view, setView] = useState<AppView>('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(false);
