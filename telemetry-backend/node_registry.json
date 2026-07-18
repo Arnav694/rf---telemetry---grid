@@ -1,0 +1,30 @@
+{
+    "anoushka-node": {
+        "display_name": "Anoushka",
+        "city": "Kharagpur",
+        "state": "West Bengal",
+        "latitude": 22.33971,
+        "longitude": 87.32501
+    },
+    "helly": {
+        "display_name": "Harrick",
+        "city": "Rajkot",
+        "state": "Gujarat",
+        "latitude": 22.29161,
+        "longitude": 70.79322
+    },
+    "muin-node": {
+        "display_name": "Muin",
+        "city": "Kanpur",
+        "state": "Uttar Pradesh",
+        "latitude": 26.449923,
+        "longitude": 80.331871
+    },
+    "node": {
+        "display_name": "Arnav",
+        "city": "Jerusalem",
+        "state": "Israel",
+        "latitude": 31.7683,
+        "longitude": 35.2137
+    }
+}
